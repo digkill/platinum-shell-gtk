@@ -1,0 +1,10 @@
+[package]
+name = "platinum-shell-gtk"
+version = "0.1.0"
+edition = "2021"
+description = "GTK4/Relm4 shell prototype for Platinum Launcher"
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+relm4 = { version = "0.9.1", features = ["macros"] }
