@@ -1,7 +1,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NavDestination {
+pub enum AppSurface {
     Home,
     Apps,
-    Ai,
-    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppRoute {
+    Surface(AppSurface),
+    App(&'static str),
 }

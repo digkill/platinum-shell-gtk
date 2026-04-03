@@ -1,5 +1,4 @@
 use crate::device::DeviceSnapshot;
-use crate::navigation::NavDestination;
 use crate::ui::picture_icon;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{self, Align, Orientation};
@@ -12,12 +11,12 @@ pub struct HomeScreen {
 #[derive(Debug, Clone)]
 pub enum HomeScreenInput {
     SetSnapshot(DeviceSnapshot),
-    OpenSection(NavDestination),
+    OpenApp(&'static str),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum HomeScreenOutput {
-    Navigate(NavDestination),
+    OpenApp(&'static str),
 }
 
 #[relm4::component(pub)]
@@ -108,8 +107,8 @@ impl SimpleComponent for HomeScreen {
             HomeScreenInput::SetSnapshot(snapshot) => {
                 self.snapshot = snapshot;
             }
-            HomeScreenInput::OpenSection(destination) => {
-                sender.output(HomeScreenOutput::Navigate(destination)).ok();
+            HomeScreenInput::OpenApp(app_id) => {
+                sender.output(HomeScreenOutput::OpenApp(app_id)).ok();
             }
         }
     }
@@ -143,53 +142,57 @@ fn launcher_grid(input_sender: relm4::Sender<HomeScreenInput>) -> gtk::FlowBox {
         .build();
     flow.add_css_class("home-app-grid");
 
-    flow.insert(&static_app_button("calendar-home", "Calendar"), -1);
-    flow.insert(&static_app_button("clock-home", "Clock"), -1);
-    flow.insert(&static_app_button("contacts-home", "Contacts"), -1);
     flow.insert(
-        &nav_app_button(
+        &app_button(
+            "calendar-home",
+            "Calendar",
+            input_sender.clone(),
+            "calendar",
+        ),
+        -1,
+    );
+    flow.insert(
+        &app_button("clock-home", "Clock", input_sender.clone(), "clock"),
+        -1,
+    );
+    flow.insert(
+        &app_button(
+            "contacts-home",
+            "Contacts",
+            input_sender.clone(),
+            "contacts",
+        ),
+        -1,
+    );
+    flow.insert(
+        &app_button(
             "platinum-one-home",
             "Platinum One",
             input_sender.clone(),
-            NavDestination::Apps,
+            "platinum_one",
         ),
         -1,
     );
+    flow.insert(&app_button("ai-home", "AI", input_sender.clone(), "ai"), -1);
     flow.insert(
-        &nav_app_button("ai-home", "AI", input_sender.clone(), NavDestination::Ai),
-        -1,
-    );
-    flow.insert(
-        &nav_app_button(
-            "settings-home",
-            "Settings",
-            input_sender,
-            NavDestination::Settings,
-        ),
+        &app_button("settings-home", "Settings", input_sender, "settings"),
         -1,
     );
 
     flow
 }
 
-fn static_app_button(icon_name: &str, title: &str) -> gtk::Button {
-    let button = gtk::Button::builder().build();
-    button.add_css_class("home-app-button");
-    button.set_child(Some(&app_button_content(icon_name, title)));
-    button
-}
-
-fn nav_app_button(
+fn app_button(
     icon_name: &str,
     title: &str,
     input_sender: relm4::Sender<HomeScreenInput>,
-    destination: NavDestination,
+    app_id: &'static str,
 ) -> gtk::Button {
     let button = gtk::Button::builder().build();
     button.add_css_class("home-app-button");
     button.set_child(Some(&app_button_content(icon_name, title)));
     button.connect_clicked(move |_| {
-        let _ = input_sender.send(HomeScreenInput::OpenSection(destination));
+        let _ = input_sender.send(HomeScreenInput::OpenApp(app_id));
     });
     button
 }
@@ -210,7 +213,7 @@ fn app_button_content(icon_name: &str, title: &str) -> gtk::Box {
         .valign(Align::Center)
         .build();
     icon_shell.add_css_class("home-app-icon-shell");
-    icon_shell.append(&picture_icon(icon_name, 74));
+    icon_shell.append(&picture_icon(icon_name, 68));
 
     let label = gtk::Label::new(Some(title));
     label.set_halign(Align::Center);

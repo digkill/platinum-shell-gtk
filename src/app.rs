@@ -1,16 +1,19 @@
+use crate::app_sdk::{AppContext, AppLaunchPayload, AppLaunchRequest, AppNavigator, AppRegistry};
+use crate::app_store::LauncherStore;
+use crate::apps::{app_registry, register_builtins};
+use crate::components::app_drawer::{AppDrawer, AppDrawerEntry, AppDrawerInput, AppDrawerOutput};
+use crate::components::app_host::{AppHost, AppHostInput, AppHostOutput};
 use crate::components::bottom_nav::{BottomNav, BottomNavInput, BottomNavOutput};
 use crate::components::home_screen::{HomeScreen, HomeScreenInput, HomeScreenOutput};
-use crate::components::screens::ai_screen::AiScreen;
-use crate::components::screens::apps_screen::AppsScreen;
-use crate::components::screens::settings_screen::{
-    SettingsScreen, SettingsScreenInput, SettingsScreenOutput,
+use crate::components::screens::apps_screen::{AppsScreen, AppsScreenInput, AppsScreenOutput};
+use crate::components::top_drawer::{
+    QuickToggle, TopDrawer, TopDrawerInput, TopDrawerOutput, TopDrawerState,
 };
 use crate::device::{load_device_snapshot, DeviceSnapshot, NetworkKind};
-use crate::navigation::NavDestination;
+use crate::device_service::{load_system_toggle_state, set_system_toggle, SystemToggle};
+use crate::navigation::{AppRoute, AppSurface};
 use crate::shell_state::{load_shell_state, ShellState};
-use crate::theme::{
-    apply_theme, load_theme_mode, resolve_theme, save_theme_mode, ResolvedTheme, ThemeMode,
-};
+use crate::theme::{apply_theme, load_theme_mode, resolve_theme, ResolvedTheme, ThemeMode};
 use crate::ui::{
     animate_battery_indicator, battery_indicator, network_kind_icon, signal_indicator,
     signal_status_dot, update_signal_indicator, update_signal_status_dot,
@@ -20,6 +23,8 @@ use relm4::gtk::gdk;
 use relm4::gtk::glib;
 use relm4::gtk::{self, Align, CssProvider, Orientation};
 use relm4::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub fn run() {
     let _ = adw::init();
@@ -28,17 +33,31 @@ pub fn run() {
 }
 
 struct ShellApp {
-    active_nav: NavDestination,
+    active_app_id: Option<&'static str>,
+    active_launch_payload: Option<AppLaunchPayload>,
+    active_route: AppRoute,
+    app_drawer: Controller<AppDrawer>,
+    app_drawer_open: bool,
+    active_surface: AppSurface,
+    app_host: Controller<AppHost>,
+    app_registry: AppRegistry,
     apps_screen: Controller<AppsScreen>,
-    ai_screen: Controller<AiScreen>,
     bottom_nav: Controller<BottomNav>,
     home_screen: Controller<HomeScreen>,
     layout_mode: LayoutMode,
     screen_carousel: adw::Carousel,
-    settings_screen: Controller<SettingsScreen>,
     shell_state: ShellState,
     snapshot: DeviceSnapshot,
+    top_drawer: Controller<TopDrawer>,
+    top_drawer_open: bool,
+    wifi_enabled: bool,
+    lte_enabled: bool,
+    silent_mode: bool,
+    battery_saver: bool,
+    running_apps: Vec<AppDrawerEntry>,
+    store: Rc<RefCell<LauncherStore>>,
     stage_shell: gtk::Box,
+    system_toggle_notice: Option<String>,
     theme_mode: ThemeMode,
 }
 
@@ -52,10 +71,16 @@ enum LayoutMode {
 #[derive(Debug)]
 enum ShellAppMsg {
     Tick,
-    Navigate(NavDestination),
+    Route(AppRoute),
+    OpenApp(&'static str),
+    OpenAppRequest(AppLaunchRequest),
+    CloseApp,
+    ToggleDrawer,
+    ToggleTopDrawer,
+    ToggleQuick(QuickToggle),
     SetLayoutMode(LayoutMode),
-    SwipeTo(NavDestination),
-    SetTheme(ThemeMode),
+    SwipeTo(AppSurface),
+    SwipeDock(i32, i32),
 }
 
 #[relm4::component]
@@ -73,17 +98,23 @@ impl SimpleComponent for ShellApp {
             set_decorated: false,
 
             #[wrap(Some)]
-            set_content = &gtk::Box {
-                set_orientation: Orientation::Vertical,
-                set_spacing: 4,
+            set_content = &gtk::Overlay {
                 set_vexpand: true,
-                set_margin_top: 0,
-                set_margin_bottom: 14,
-                set_margin_start: 8,
-                set_margin_end: 8,
-                add_css_class: "shell-root",
+                set_hexpand: true,
 
-                append = &gtk::Box {
+                #[wrap(Some)]
+                set_child = &gtk::Box {
+                    set_orientation: Orientation::Vertical,
+                    set_spacing: 4,
+                    set_vexpand: true,
+                    set_margin_top: 0,
+                    set_margin_bottom: 14,
+                    set_margin_start: 8,
+                    set_margin_end: 8,
+                    add_css_class: "shell-root",
+
+                    #[name(top_status_bar)]
+                    gtk::Box {
                     set_orientation: Orientation::Horizontal,
                     set_spacing: 12,
                     set_valign: Align::Start,
@@ -120,7 +151,6 @@ impl SimpleComponent for ShellApp {
                                 #[local_ref]
                                 signal_widget -> gtk::Box {}
                             },
-
                         },
                     },
 
@@ -142,21 +172,13 @@ impl SimpleComponent for ShellApp {
                             },
                         },
                     }
-                },
+                    },
 
-                #[local]
-                stage_shell -> gtk::Box {
-                    set_vexpand: true,
-                    set_hexpand: true,
-                },
-
-                append = &gtk::Box {
-                    set_halign: Align::Center,
-                    add_css_class: "bottom-safe-area",
-
-                    append = &gtk::Box {
-                        add_css_class: "home-indicator",
-                    }
+                    #[name(shell_overlay)]
+                    gtk::Overlay {
+                        set_vexpand: true,
+                        set_hexpand: true,
+                    },
                 },
             }
         }
@@ -173,55 +195,89 @@ impl SimpleComponent for ShellApp {
         apply_theme(theme_mode);
 
         let snapshot = load_device_snapshot();
+        let toggles = load_system_toggle_state(&snapshot);
+        let store = Rc::new(RefCell::new(LauncherStore::load_or_init(
+            snapshot.network_is_online,
+        )));
+        let app_context = AppContext {
+            launch_payload: None,
+            navigator: AppNavigator::new(|_| {}),
+            snapshot: snapshot.clone(),
+            store: store.clone(),
+        };
+        register_builtins(&app_context);
+        let app_registry = app_registry();
         let shell_state = load_shell_state(&snapshot);
 
         let home_screen = HomeScreen::builder().launch(snapshot.clone()).forward(
             sender.input_sender(),
             |output| match output {
-                HomeScreenOutput::Navigate(destination) => ShellAppMsg::Navigate(destination),
+                HomeScreenOutput::OpenApp(app_id) => ShellAppMsg::OpenApp(app_id),
             },
         );
         let apps_screen = AppsScreen::builder()
             .launch(shell_state.apps.clone())
-            .detach();
-        let ai_screen = AiScreen::builder().launch(shell_state.ai.clone()).detach();
-        let settings_screen =
-            SettingsScreen::builder()
-                .launch(theme_mode)
-                .forward(sender.input_sender(), |output| match output {
-                    SettingsScreenOutput::ChooseTheme(theme_mode) => {
-                        ShellAppMsg::SetTheme(theme_mode)
-                    }
-                });
-        let bottom_nav = BottomNav::builder().launch(NavDestination::Home).forward(
-            sender.input_sender(),
-            |output| match output {
-                BottomNavOutput::Navigate(destination) => ShellAppMsg::Navigate(destination),
-            },
-        );
+            .forward(sender.input_sender(), |output| match output {
+                AppsScreenOutput::OpenApp(app_id) => ShellAppMsg::OpenApp(app_id),
+            });
+        let bottom_nav = BottomNav::builder()
+            .launch(AppRoute::Surface(AppSurface::Home))
+            .forward(sender.input_sender(), |output| match output {
+                BottomNavOutput::Navigate(route) => ShellAppMsg::Route(route),
+            });
+        let app_host = AppHost::builder()
+            .launch(())
+            .forward(sender.input_sender(), |output| match output {
+                AppHostOutput::CloseRequested => ShellAppMsg::CloseApp,
+            });
+        let top_drawer = TopDrawer::builder()
+            .launch(TopDrawerState {
+                snapshot: snapshot.clone(),
+                wifi_enabled: toggles.wifi_enabled,
+                lte_enabled: toggles.lte_enabled,
+                silent_mode: toggles.silent_mode,
+                battery_saver: toggles.battery_saver,
+                notice: None,
+            })
+            .forward(sender.input_sender(), |output| match output {
+                TopDrawerOutput::ToggleRequested => ShellAppMsg::ToggleTopDrawer,
+                TopDrawerOutput::ToggleQuick(toggle) => ShellAppMsg::ToggleQuick(toggle),
+            });
+        let app_drawer = AppDrawer::builder()
+            .launch(())
+            .forward(sender.input_sender(), |output| match output {
+                AppDrawerOutput::OpenApp(request) => ShellAppMsg::OpenAppRequest(request),
+            });
+        let top_drawer_widget = top_drawer.widget().clone();
+        let app_drawer_widget = app_drawer.widget().clone();
 
         let home_screen_widget = wrap_page(home_screen.widget());
         let apps_screen_widget = wrap_page(apps_screen.widget());
-        let ai_screen_widget = wrap_page(ai_screen.widget());
-        let settings_screen_widget = wrap_page(settings_screen.widget());
+        let app_host_widget = app_host.widget();
         let bottom_nav_widget = bottom_nav.widget();
         let screen_carousel = adw::Carousel::builder()
             .interactive(true)
             .allow_mouse_drag(true)
             .allow_long_swipes(false)
             .allow_scroll_wheel(false)
-            .spacing(18)
+            .spacing(26)
             .vexpand(true)
             .hexpand(true)
             .build();
+        screen_carousel.add_css_class("shell-carousel");
         screen_carousel.append(&home_screen_widget);
         screen_carousel.append(&apps_screen_widget);
-        screen_carousel.append(&ai_screen_widget);
-        screen_carousel.append(&settings_screen_widget);
         screen_carousel.connect_page_changed({
             let input_sender = sender.input_sender().clone();
             move |_, index| {
-                let _ = input_sender.send(ShellAppMsg::SwipeTo(nav_destination_for_index(index)));
+                let _ = input_sender.send(ShellAppMsg::SwipeTo(surface_for_index(index)));
+            }
+        });
+        screen_carousel.connect_position_notify({
+            let home_page_widget = home_screen_widget.clone();
+            let apps_page_widget = apps_screen_widget.clone();
+            move |carousel| {
+                apply_carousel_parallax(&home_page_widget, &apps_page_widget, carousel.position());
             }
         });
         let stage_shell = gtk::Box::builder()
@@ -231,20 +287,37 @@ impl SimpleComponent for ShellApp {
             .hexpand(true)
             .build();
         stage_shell.append(&screen_carousel);
+        app_host_widget.set_vexpand(true);
+        app_host_widget.set_hexpand(true);
+        stage_shell.append(app_host_widget);
         bottom_nav_widget.set_valign(Align::End);
         stage_shell.append(bottom_nav_widget);
         let model = ShellApp {
-            active_nav: NavDestination::Home,
+            active_app_id: None,
+            active_launch_payload: None,
+            active_route: AppRoute::Surface(AppSurface::Home),
+            app_drawer,
+            app_drawer_open: false,
+            active_surface: AppSurface::Home,
+            app_host,
+            app_registry,
             apps_screen,
-            ai_screen,
             bottom_nav,
             home_screen,
             layout_mode: LayoutMode::Compact,
+            running_apps: Vec::new(),
             screen_carousel: screen_carousel.clone(),
-            settings_screen,
             shell_state,
             snapshot,
+            top_drawer,
+            top_drawer_open: false,
+            wifi_enabled: toggles.wifi_enabled,
+            lte_enabled: toggles.lte_enabled,
+            silent_mode: toggles.silent_mode,
+            battery_saver: toggles.battery_saver,
+            store,
             stage_shell: stage_shell.clone(),
+            system_toggle_notice: None,
             theme_mode,
         };
         let network_icon = network_kind_icon(model.snapshot.network_kind);
@@ -255,6 +328,13 @@ impl SimpleComponent for ShellApp {
             model.snapshot.battery_charging,
         );
         let widgets = view_output!();
+        apply_carousel_parallax(&home_screen_widget, &apps_screen_widget, 0.0);
+        widgets.shell_overlay.set_child(Some(&stage_shell));
+        widgets.shell_overlay.add_overlay(&top_drawer_widget);
+        widgets.shell_overlay.add_overlay(&app_drawer_widget);
+        widgets
+            .shell_overlay
+            .add_overlay(&bottom_long_press_hotspot(sender.input_sender().clone()));
 
         root.fullscreen();
         sync_window_to_screen_height(&root);
@@ -267,6 +347,35 @@ impl SimpleComponent for ShellApp {
         install_breakpoints(&widgets.main_window, sender.input_sender().clone());
         apply_window_theme(&widgets.main_window, resolve_theme(model.theme_mode));
         sync_shell_state(&model, &widgets);
+        widgets.shell_overlay.add_controller({
+            let gesture = gtk::GestureDrag::new();
+            gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let input = sender.input_sender().clone();
+            gesture.connect_drag_end(move |_, offset_x, offset_y| {
+                let _ = input.send(ShellAppMsg::SwipeDock(offset_x as i32, offset_y as i32));
+            });
+            gesture
+        });
+        widgets.top_status_bar.add_controller({
+            let gesture = gtk::GestureClick::new();
+            let input = sender.input_sender().clone();
+            gesture.connect_released(move |_, _, _, _| {
+                let _ = input.send(ShellAppMsg::ToggleTopDrawer);
+            });
+            gesture
+        });
+        model
+            .app_drawer
+            .emit(AppDrawerInput::SetEntries(model.running_apps.clone()));
+        model
+            .app_drawer
+            .emit(AppDrawerInput::SetOpen(model.app_drawer_open));
+        model
+            .top_drawer
+            .emit(TopDrawerInput::SetState(top_drawer_state(&model)));
+        model
+            .top_drawer
+            .emit(TopDrawerInput::SetOpen(model.top_drawer_open));
 
         let input_sender = sender.input_sender().clone();
         glib::timeout_add_seconds_local(1, move || {
@@ -277,41 +386,175 @@ impl SimpleComponent for ShellApp {
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             ShellAppMsg::Tick => {
+                let current_theme_mode = load_theme_mode();
+                if current_theme_mode != self.theme_mode {
+                    self.theme_mode = current_theme_mode;
+                    apply_theme(current_theme_mode);
+                }
+
                 self.snapshot = load_device_snapshot();
+                let toggles = load_system_toggle_state(&self.snapshot);
+                self.wifi_enabled = toggles.wifi_enabled;
+                self.lte_enabled = toggles.lte_enabled;
+                self.silent_mode = toggles.silent_mode;
+                self.battery_saver = toggles.battery_saver;
                 self.shell_state = load_shell_state(&self.snapshot);
                 self.home_screen
                     .emit(HomeScreenInput::SetSnapshot(self.snapshot.clone()));
-                self.apps_screen.emit(
-                    crate::components::screens::apps_screen::AppsScreenInput::SetState(
-                        self.shell_state.apps.clone(),
-                    ),
-                );
-                self.ai_screen.emit(
-                    crate::components::screens::ai_screen::AiScreenInput::SetState(
-                        self.shell_state.ai.clone(),
-                    ),
+                self.apps_screen
+                    .emit(AppsScreenInput::SetState(self.shell_state.apps.clone()));
+                self.top_drawer
+                    .emit(TopDrawerInput::SetState(top_drawer_state(self)));
+            }
+            ShellAppMsg::Route(route) => match route {
+                AppRoute::Surface(surface) => {
+                    if self.active_app_id.is_some() {
+                        self.app_host.emit(AppHostInput::Close);
+                        self.active_app_id = None;
+                        self.active_launch_payload = None;
+                    }
+                    self.active_route = route;
+                    self.active_surface = surface;
+                    self.bottom_nav.emit(BottomNavInput::SetActive(route));
+                }
+                AppRoute::App(app_id) => {
+                    self.active_route = route;
+                    self.bottom_nav.emit(BottomNavInput::SetActive(route));
+                    self.open_app(app_id, None, sender.input_sender().clone());
+                }
+            },
+            ShellAppMsg::OpenApp(app_id) => {
+                if matches!(app_id, "call" | "message") {
+                    self.active_route = AppRoute::App(app_id);
+                    self.bottom_nav
+                        .emit(BottomNavInput::SetActive(self.active_route));
+                }
+                self.open_app(app_id, None, sender.input_sender().clone());
+            }
+            ShellAppMsg::OpenAppRequest(request) => {
+                if matches!(request.app_id, "call" | "message") {
+                    self.active_route = AppRoute::App(request.app_id);
+                    self.bottom_nav
+                        .emit(BottomNavInput::SetActive(self.active_route));
+                }
+                self.open_app(
+                    request.app_id,
+                    request.payload,
+                    sender.input_sender().clone(),
                 );
             }
-            ShellAppMsg::Navigate(destination) => {
-                self.active_nav = destination;
-                self.bottom_nav.emit(BottomNavInput::SetActive(destination));
+            ShellAppMsg::CloseApp => {
+                if let Some(app_id) = self.active_app_id.take() {
+                    let app_context = AppContext {
+                        launch_payload: self.active_launch_payload.clone(),
+                        navigator: AppNavigator::new(|_| {}),
+                        snapshot: self.snapshot.clone(),
+                        store: self.store.clone(),
+                    };
+                    self.app_registry.deactivate(app_id, &app_context);
+                    self.remove_running_app(app_id);
+                }
+
+                self.active_launch_payload = None;
+                self.active_route = AppRoute::Surface(self.active_surface);
+                self.app_drawer_open = false;
+                self.app_host.emit(AppHostInput::Close);
+                self.app_drawer
+                    .emit(AppDrawerInput::SetEntries(self.running_apps.clone()));
+                self.app_drawer
+                    .emit(AppDrawerInput::SetOpen(self.app_drawer_open));
+                self.top_drawer
+                    .emit(TopDrawerInput::SetOpen(self.top_drawer_open));
+                self.bottom_nav
+                    .emit(BottomNavInput::SetActive(self.active_route));
+            }
+            ShellAppMsg::ToggleDrawer => {
+                self.app_drawer_open = !self.app_drawer_open;
+                if self.app_drawer_open {
+                    self.top_drawer_open = false;
+                }
+                self.app_drawer
+                    .emit(AppDrawerInput::SetOpen(self.app_drawer_open));
+                self.top_drawer
+                    .emit(TopDrawerInput::SetOpen(self.top_drawer_open));
+            }
+            ShellAppMsg::ToggleTopDrawer => {
+                self.top_drawer_open = !self.top_drawer_open;
+                if self.top_drawer_open {
+                    self.app_drawer_open = false;
+                }
+                self.top_drawer
+                    .emit(TopDrawerInput::SetOpen(self.top_drawer_open));
+                self.app_drawer
+                    .emit(AppDrawerInput::SetOpen(self.app_drawer_open));
+            }
+            ShellAppMsg::ToggleQuick(toggle) => {
+                let applied = match toggle {
+                    QuickToggle::Wifi => {
+                        let next = !self.wifi_enabled;
+                        set_system_toggle(SystemToggle::Wifi, next)
+                    }
+                    QuickToggle::Lte => {
+                        let next = !self.lte_enabled;
+                        set_system_toggle(SystemToggle::Lte, next)
+                    }
+                    QuickToggle::Silent => {
+                        let next = !self.silent_mode;
+                        set_system_toggle(SystemToggle::Silent, next)
+                    }
+                    QuickToggle::BatterySaver => {
+                        let next = !self.battery_saver;
+                        set_system_toggle(SystemToggle::BatterySaver, next)
+                    }
+                };
+
+                match applied {
+                    Ok(()) => {
+                        self.system_toggle_notice = None;
+                        self.snapshot = load_device_snapshot();
+                        let toggles = load_system_toggle_state(&self.snapshot);
+                        self.wifi_enabled = toggles.wifi_enabled;
+                        self.lte_enabled = toggles.lte_enabled;
+                        self.silent_mode = toggles.silent_mode;
+                        self.battery_saver = toggles.battery_saver;
+                    }
+                    Err(error) => {
+                        self.system_toggle_notice = Some(error);
+                    }
+                }
+                self.top_drawer
+                    .emit(TopDrawerInput::SetState(top_drawer_state(self)));
             }
             ShellAppMsg::SetLayoutMode(layout_mode) => {
                 self.layout_mode = layout_mode;
             }
-            ShellAppMsg::SwipeTo(destination) => {
-                self.active_nav = destination;
-                self.bottom_nav.emit(BottomNavInput::SetActive(destination));
+            ShellAppMsg::SwipeTo(surface) => {
+                self.active_surface = surface;
+                if self.active_app_id.is_none() {
+                    self.active_route = AppRoute::Surface(surface);
+                    self.bottom_nav
+                        .emit(BottomNavInput::SetActive(self.active_route));
+                }
             }
-            ShellAppMsg::SetTheme(theme_mode) => {
-                self.theme_mode = theme_mode;
-                apply_theme(theme_mode);
-                save_theme_mode(theme_mode);
-                self.settings_screen
-                    .emit(SettingsScreenInput::SetThemeMode(theme_mode));
+            ShellAppMsg::SwipeDock(offset_x, offset_y) => {
+                if self.top_drawer_open || self.app_drawer_open {
+                    return;
+                }
+
+                if offset_x.abs() < 44 || offset_x.abs() <= offset_y.abs() {
+                    return;
+                }
+
+                let next_route = if offset_x < 0 {
+                    dock_tab_next(self.active_route)
+                } else {
+                    dock_tab_prev(self.active_route)
+                };
+
+                sender.input(next_route_to_msg(next_route));
             }
         }
     }
@@ -321,6 +564,102 @@ impl SimpleComponent for ShellApp {
         apply_layout_mode(model, widgets);
         sync_shell_state(model, widgets);
     }
+}
+
+impl ShellApp {
+    fn open_app(
+        &mut self,
+        app_id: &'static str,
+        payload: Option<AppLaunchPayload>,
+        input_sender: relm4::Sender<ShellAppMsg>,
+    ) {
+        let app_context = AppContext {
+            launch_payload: payload.clone(),
+            navigator: AppNavigator::new(move |request| {
+                let _ = input_sender.send(ShellAppMsg::OpenAppRequest(request));
+            }),
+            snapshot: self.snapshot.clone(),
+            store: self.store.clone(),
+        };
+
+        if let Some(previous_app_id) = self.active_app_id.replace(app_id) {
+            if previous_app_id != app_id {
+                self.app_registry.deactivate(previous_app_id, &app_context);
+            }
+        }
+        self.active_launch_payload = payload;
+
+        if let Some(manifest) = self.app_registry.manifest(app_id) {
+            if let Some(root) = self.app_registry.build_root(app_id, &app_context) {
+                self.upsert_running_app(manifest, self.active_launch_payload.clone());
+                self.app_drawer_open = false;
+                self.top_drawer_open = false;
+                self.app_host.emit(AppHostInput::Show { manifest, root });
+                self.app_drawer
+                    .emit(AppDrawerInput::SetEntries(self.running_apps.clone()));
+                self.app_drawer
+                    .emit(AppDrawerInput::SetOpen(self.app_drawer_open));
+                self.top_drawer
+                    .emit(TopDrawerInput::SetOpen(self.top_drawer_open));
+            }
+        }
+    }
+
+    fn upsert_running_app(
+        &mut self,
+        manifest: crate::app_sdk::AppManifest,
+        payload: Option<AppLaunchPayload>,
+    ) {
+        for entry in &mut self.running_apps {
+            entry.is_active = false;
+        }
+
+        self.running_apps
+            .retain(|entry| entry.manifest.id != manifest.id);
+        self.running_apps.insert(
+            0,
+            AppDrawerEntry {
+                manifest,
+                payload,
+                is_active: true,
+            },
+        );
+    }
+
+    fn remove_running_app(&mut self, app_id: &'static str) {
+        self.running_apps
+            .retain(|entry| entry.manifest.id != app_id);
+    }
+}
+
+fn top_drawer_state(model: &ShellApp) -> TopDrawerState {
+    TopDrawerState {
+        snapshot: model.snapshot.clone(),
+        wifi_enabled: model.wifi_enabled,
+        lte_enabled: model.lte_enabled,
+        silent_mode: model.silent_mode,
+        battery_saver: model.battery_saver,
+        notice: model.system_toggle_notice.clone(),
+    }
+}
+
+fn bottom_long_press_hotspot(input_sender: relm4::Sender<ShellAppMsg>) -> gtk::Box {
+    let hotspot = gtk::Box::builder()
+        .halign(Align::Center)
+        .valign(Align::End)
+        .width_request(148)
+        .height_request(28)
+        .margin_bottom(6)
+        .build();
+    hotspot.add_css_class("bottom-drawer-hotspot");
+
+    let gesture = gtk::GestureLongPress::new();
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    gesture.connect_pressed(move |_, _, _| {
+        let _ = input_sender.send(ShellAppMsg::ToggleDrawer);
+    });
+    hotspot.add_controller(gesture);
+    hotspot
 }
 
 fn sync_shell_state(model: &ShellApp, widgets: &ShellAppWidgets) {
@@ -335,8 +674,19 @@ fn sync_shell_state(model: &ShellApp, widgets: &ShellAppWidgets) {
     replace_network_icon(&widgets.network_icon, model.snapshot.network_kind);
     update_signal_status_dot(&widgets.network_dot, model.snapshot.network_is_online);
     update_signal_indicator(&widgets.signal_widget, model.snapshot.signal_level);
+    model
+        .screen_carousel
+        .set_visible(model.active_app_id.is_none());
+    model
+        .bottom_nav
+        .widget()
+        .set_visible(model.active_app_id.is_none());
+    model
+        .app_host
+        .widget()
+        .set_visible(model.active_app_id.is_some());
 
-    let target_index = nav_index(model.active_nav);
+    let target_index = surface_index(model.active_surface);
     let current_index = model.screen_carousel.position().round() as u32;
     if current_index != target_index {
         let page = model.screen_carousel.nth_page(target_index);
@@ -354,8 +704,29 @@ fn wrap_page(widget: &gtk::Box) -> gtk::ScrolledWindow {
         .propagate_natural_width(true)
         .build();
     scrolled.add_css_class("page-scroll");
+    scrolled.set_margin_start(12);
+    scrolled.set_margin_end(12);
     scrolled.set_child(Some(widget));
     scrolled
+}
+
+fn apply_carousel_parallax(
+    home_page: &gtk::ScrolledWindow,
+    apps_page: &gtk::ScrolledWindow,
+    position: f64,
+) {
+    apply_page_parallax(home_page, 0.0, position);
+    apply_page_parallax(apps_page, 1.0, position);
+}
+
+fn apply_page_parallax(page: &gtk::ScrolledWindow, index: f64, position: f64) {
+    let delta = (index - position).clamp(-1.0, 1.0);
+    let shift = (delta * 20.0).round() as i32;
+    let base = 12;
+
+    page.set_margin_start(base + shift.max(0));
+    page.set_margin_end(base + (-shift).max(0));
+    page.set_opacity((1.0 - delta.abs() * 0.28).clamp(0.72, 1.0));
 }
 
 fn sync_window_to_screen_height(window: &adw::ApplicationWindow) {
@@ -501,23 +872,43 @@ fn replace_network_icon(widget: &gtk::Picture, kind: NetworkKind) {
     )));
 }
 
-fn nav_index(destination: NavDestination) -> u32 {
-    match destination {
-        NavDestination::Home => 0,
-        NavDestination::Apps => 1,
-        NavDestination::Ai => 2,
-        NavDestination::Settings => 3,
+fn surface_index(surface: AppSurface) -> u32 {
+    match surface {
+        AppSurface::Home => 0,
+        AppSurface::Apps => 1,
     }
 }
 
-fn nav_destination_for_index(index: u32) -> NavDestination {
+fn surface_for_index(index: u32) -> AppSurface {
     match index {
-        0 => NavDestination::Home,
-        1 => NavDestination::Apps,
-        2 => NavDestination::Ai,
-        3 => NavDestination::Settings,
-        _ => NavDestination::Home,
+        0 => AppSurface::Home,
+        1 => AppSurface::Apps,
+        _ => AppSurface::Home,
     }
+}
+
+fn dock_tab_next(route: AppRoute) -> AppRoute {
+    match route {
+        AppRoute::Surface(AppSurface::Home) => AppRoute::Surface(AppSurface::Apps),
+        AppRoute::Surface(AppSurface::Apps) => AppRoute::App("call"),
+        AppRoute::App("call") => AppRoute::App("message"),
+        AppRoute::App("message") => AppRoute::Surface(AppSurface::Home),
+        _ => AppRoute::Surface(AppSurface::Home),
+    }
+}
+
+fn dock_tab_prev(route: AppRoute) -> AppRoute {
+    match route {
+        AppRoute::Surface(AppSurface::Home) => AppRoute::App("message"),
+        AppRoute::Surface(AppSurface::Apps) => AppRoute::Surface(AppSurface::Home),
+        AppRoute::App("call") => AppRoute::Surface(AppSurface::Apps),
+        AppRoute::App("message") => AppRoute::App("call"),
+        _ => AppRoute::Surface(AppSurface::Home),
+    }
+}
+
+fn next_route_to_msg(route: AppRoute) -> ShellAppMsg {
+    ShellAppMsg::Route(route)
 }
 
 fn apply_window_theme(window: &impl IsA<gtk::Widget>, theme: ResolvedTheme) {
@@ -588,6 +979,132 @@ fn install_css() {
             border-radius: 999px;
         }
 
+        .top-drawer-layer {
+            margin-top: 2px;
+            margin-left: 2px;
+            margin-right: 2px;
+        }
+
+        .top-drawer-handle-button {
+            border: none;
+            background: transparent;
+            box-shadow: none;
+            padding: 0;
+        }
+
+        .top-drawer-handle-button:hover,
+        .top-drawer-handle-button:active,
+        .top-drawer-handle-button:focus {
+            border: none;
+            background: transparent;
+            box-shadow: none;
+        }
+
+        .top-drawer-handle {
+            min-width: 72px;
+            min-height: 4px;
+            border-radius: 999px;
+        }
+
+        .top-drawer-sheet {
+            border-radius: 28px;
+            padding: 16px;
+        }
+
+        .top-drawer-time {
+            font-size: 28px;
+            font-weight: 760;
+            letter-spacing: -0.03em;
+        }
+
+        .top-drawer-date {
+            font-size: 14px;
+            font-weight: 540;
+        }
+
+        .top-drawer-tile {
+            min-width: 0;
+            min-height: 112px;
+            padding: 14px;
+            border-radius: 22px;
+        }
+
+        .top-drawer-row {
+            padding: 14px 16px;
+            border-radius: 18px;
+        }
+
+        .app-drawer-layer {
+            margin-left: 8px;
+            margin-right: 8px;
+            margin-bottom: 10px;
+        }
+
+        .bottom-drawer-hotspot {
+            background: transparent;
+        }
+
+        .app-drawer-handle-button {
+            border: none;
+            background: transparent;
+            box-shadow: none;
+            padding: 0;
+        }
+
+        .app-drawer-handle-button:hover,
+        .app-drawer-handle-button:active,
+        .app-drawer-handle-button:focus {
+            border: none;
+            background: transparent;
+            box-shadow: none;
+        }
+
+        .app-drawer-handle {
+            min-width: 118px;
+            min-height: 6px;
+            border-radius: 999px;
+        }
+
+        .app-drawer-sheet {
+            border-radius: 30px;
+            padding: 16px;
+        }
+
+        .app-drawer-title {
+            font-size: 18px;
+            font-weight: 720;
+            letter-spacing: -0.02em;
+        }
+
+        .app-drawer-close {
+            min-height: 32px;
+            border-radius: 14px;
+            padding: 0 12px;
+        }
+
+        .app-drawer-entry {
+            border: none;
+            background: transparent;
+            box-shadow: none;
+            padding: 0;
+        }
+
+        .app-drawer-entry:hover,
+        .app-drawer-entry:active,
+        .app-drawer-entry:focus {
+            border: none;
+            box-shadow: none;
+        }
+
+        .app-drawer-entry-icon-shell {
+            border-radius: 16px;
+            padding: 8px;
+        }
+
+        .app-drawer-empty {
+            padding: 28px 0 18px;
+        }
+
         window.device-rpi-portrait .shell-root {
             margin-top: 0;
             margin-bottom: 10px;
@@ -611,6 +1128,16 @@ fn install_css() {
         window.device-rpi-portrait .home-indicator {
             min-width: 128px;
             min-height: 4px;
+        }
+
+        window.device-rpi-portrait .app-drawer-layer {
+            margin-left: 4px;
+            margin-right: 4px;
+            margin-bottom: 8px;
+        }
+
+        window.device-rpi-portrait .top-drawer-sheet {
+            padding: 14px;
         }
 
         .section-card,
@@ -799,34 +1326,88 @@ fn install_css() {
         }
 
         .apps-screen {
-            padding-top: 18px;
-            padding-bottom: 24px;
+            padding-top: 12px;
+            padding-bottom: 18px;
         }
 
         flowbox.apps-icon-grid {
             background: transparent;
+            margin-top: 2px;
+            margin-bottom: 2px;
         }
 
         flowbox.apps-icon-grid flowboxchild {
             padding: 0;
             margin: 0;
-            min-width: 92px;
+            min-width: 104px;
         }
 
         .apps-icon-tile {
-            min-width: 88px;
-            padding: 4px 2px;
+            min-width: 104px;
+            padding: 4px 2px 10px;
+        }
+
+        .apps-icon-button {
+            padding: 0;
+            border: none;
+            background: transparent;
+            box-shadow: none;
+        }
+
+        .apps-icon-button:hover,
+        .apps-icon-button:active,
+        .apps-icon-button:focus {
+            border: none;
+            background: transparent;
+            box-shadow: none;
         }
 
         .apps-icon-shell {
-            border-radius: 24px;
-            padding: 18px;
+            border-radius: 22px;
+            padding: 0;
+            border: none;
+            box-shadow: none;
         }
 
         .apps-icon-label {
-            font-size: 14px;
-            font-weight: 620;
+            font-size: 15px;
+            font-weight: 520;
             letter-spacing: -0.01em;
+        }
+
+        .call-dialer-card,
+        .call-recents-card,
+        .message-thread-card,
+        .message-detail-card {
+            padding-top: 14px;
+            padding-bottom: 14px;
+        }
+
+        .app-host {
+            padding: 10px 4px 0;
+        }
+
+        .app-host-bar {
+            padding: 0 2px 8px;
+        }
+
+        .app-host-back {
+            min-height: 34px;
+            border-radius: 14px;
+            padding: 0 14px;
+            font-size: 13px;
+            font-weight: 650;
+        }
+
+        .app-host-title {
+            font-size: 18px;
+            font-weight: 720;
+            letter-spacing: -0.02em;
+        }
+
+        .app-host-content {
+            border-radius: 28px;
+            min-height: 0;
         }
 
         .launcher-tile {
@@ -843,8 +1424,8 @@ fn install_css() {
         }
 
         window.layout-compact .apps-screen {
-            padding-top: 10px;
-            padding-bottom: 18px;
+            padding-top: 8px;
+            padding-bottom: 14px;
         }
 
         window.layout-compact .home-clock-card {
@@ -871,8 +1452,8 @@ fn install_css() {
         }
 
         window.layout-compact .apps-icon-shell {
-            border-radius: 22px;
-            padding: 16px;
+            border-radius: 20px;
+            padding: 0;
         }
 
         window.layout-compact .apps-icon-label {
@@ -898,8 +1479,8 @@ fn install_css() {
         }
 
         window.layout-expanded .apps-icon-shell {
-            border-radius: 26px;
-            padding: 20px;
+            border-radius: 24px;
+            padding: 0;
         }
 
         flowbox.launcher-flowbox,
@@ -936,49 +1517,48 @@ fn install_css() {
         }
 
         .nav-button {
-            min-height: 50px;
-            min-width: 64px;
-            border-radius: 14px;
-            font-size: 11px;
-            font-weight: 650;
-        }
-
-        .nav-label {
-            font-size: 11px;
-            font-weight: 620;
-            letter-spacing: -0.01em;
+            min-height: 70px;
+            min-width: 70px;
+            border-radius: 18px;
+            padding: 10px;
         }
 
         .nav-icon {
-            min-width: 24px;
-            min-height: 24px;
+            min-width: 42px;
+            min-height: 42px;
+        }
+
+        .nav-underline {
+            border-radius: 999px;
+            background: linear-gradient(90deg, #59c7ff 0%, #8d87ff 100%);
         }
 
         window.layout-compact .nav-card {
-            padding: 8px;
-            border-radius: 16px;
+            padding: 8px 10px 6px;
+            border-radius: 26px;
         }
 
         window.layout-compact .nav-button {
-            min-height: 46px;
-            min-width: 60px;
-            border-radius: 12px;
-            font-size: 10px;
-        }
-
-        window.layout-compact .nav-label {
-            font-size: 10px;
+            min-height: 66px;
+            min-width: 66px;
+            border-radius: 18px;
         }
 
         window.layout-expanded .nav-card {
-            padding: 8px;
-            border-radius: 16px;
+            padding: 8px 10px 6px;
+            border-radius: 26px;
+        }
+
+        .nav-card {
+            padding: 8px 10px 6px;
+            border-radius: 26px;
+            margin-bottom: 0;
         }
 
         window.layout-expanded .nav-button {
-            min-height: 48px;
-            min-width: 62px;
-            border-radius: 13px;
+            min-height: 72px;
+            min-width: 72px;
+            border-radius: 18px;
         }
 
         .theme-button {
@@ -1153,12 +1733,45 @@ fn install_css() {
             border: 1px solid rgba(255, 255, 255, 0.72);
         }
 
+        window.theme-light .nav-card {
+            border: 1px solid rgba(255, 255, 255, 0.84);
+            background: rgba(255, 255, 255, 0.20);
+            box-shadow:
+                0 18px 36px rgba(122, 146, 181, 0.16),
+                0 8px 24px rgba(255, 255, 255, 0.12),
+                inset 0 1px 0 rgba(255, 255, 255, 0.84);
+        }
+
+        window.theme-light .nav-card-pulse {
+            background: rgba(255, 255, 255, 0.28);
+            box-shadow:
+                0 20px 40px rgba(122, 146, 181, 0.18),
+                0 10px 28px rgba(255, 255, 255, 0.16),
+                inset 0 1px 0 rgba(255, 255, 255, 0.92);
+        }
+
+        window.theme-light .nav-card-pulse-settle {
+            background: rgba(255, 255, 255, 0.24);
+            box-shadow:
+                0 18px 36px rgba(122, 146, 181, 0.17),
+                0 8px 24px rgba(255, 255, 255, 0.13),
+                inset 0 1px 0 rgba(255, 255, 255, 0.88);
+        }
+
         window.theme-light .top-safe-island {
             background: rgba(12, 18, 30, 0.94);
             box-shadow: 0 10px 22px rgba(121, 140, 170, 0.18);
         }
 
         window.theme-light .home-indicator {
+            background: rgba(20, 29, 44, 0.72);
+        }
+
+        window.theme-light .top-drawer-handle {
+            background: rgba(20, 29, 44, 0.42);
+        }
+
+        window.theme-light .app-drawer-handle {
             background: rgba(20, 29, 44, 0.72);
         }
 
@@ -1205,12 +1818,10 @@ fn install_css() {
 
         window.theme-light .nav-button,
         window.theme-light .theme-button {
-            background: rgba(255, 255, 255, 0.36);
-            border: 1px solid rgba(201, 219, 244, 0.82);
-            color: #48678f;
-            box-shadow:
-                inset 0 1px 0 rgba(255, 255, 255, 0.95),
-                0 8px 20px rgba(160, 180, 205, 0.1);
+            background: transparent;
+            border: none;
+            color: #6d7b93;
+            box-shadow: none;
         }
 
         window.theme-light .nav-button image {
@@ -1220,14 +1831,13 @@ fn install_css() {
         window.theme-light .nav-button-active,
         window.theme-light .theme-button-active {
             background:
-                linear-gradient(180deg, rgba(155, 214, 255, 0.36) 0%, rgba(203, 215, 255, 0.34) 100%);
-            border: 1px solid rgba(150, 194, 245, 0.92);
-            color: #173252;
+                linear-gradient(180deg, rgba(255, 255, 255, 0.40), rgba(240, 245, 255, 0.56));
+            border: 1px solid rgba(255, 255, 255, 0.68);
+            color: #223047;
             box-shadow:
-                0 0 0 1px rgba(166, 205, 249, 0.58),
-                0 0 22px rgba(120, 180, 245, 0.28),
-                0 12px 28px rgba(120, 170, 228, 0.24),
-                inset 0 1px 0 rgba(255, 255, 255, 0.96);
+                0 10px 18px rgba(122, 146, 181, 0.14),
+                0 0 18px rgba(255, 255, 255, 0.12),
+                inset 0 1px 0 rgba(255, 255, 255, 0.86);
         }
 
         window.theme-light .nav-button-active image {
@@ -1253,15 +1863,62 @@ fn install_css() {
         }
 
         window.theme-light .apps-icon-shell {
-            background: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(243, 248, 255, 0.9) 100%);
-            border: 1px solid rgba(198, 217, 244, 0.88);
-            box-shadow:
-                inset 0 1px 0 rgba(255, 255, 255, 0.98),
-                0 12px 24px rgba(168, 188, 214, 0.16);
+            background: transparent;
+            border: none;
+            box-shadow: none;
         }
 
         window.theme-light .apps-icon-label {
             color: #1f3f67;
+        }
+
+        window.theme-light .app-drawer-sheet {
+            background: rgba(255, 255, 255, 0.82);
+            border: 1px solid rgba(198, 217, 244, 0.9);
+            box-shadow:
+                0 18px 38px rgba(154, 176, 206, 0.24),
+                inset 0 1px 0 rgba(255, 255, 255, 0.98);
+        }
+
+        window.theme-light .app-drawer-close,
+        window.theme-light .app-drawer-entry {
+            background: rgba(255, 255, 255, 0.7);
+            border: 1px solid rgba(198, 217, 244, 0.84);
+            color: #27456d;
+        }
+
+        window.theme-light .app-drawer-entry-active {
+            background: linear-gradient(180deg, rgba(155, 214, 255, 0.3) 0%, rgba(203, 215, 255, 0.28) 100%);
+            border: 1px solid rgba(150, 194, 245, 0.92);
+        }
+
+        window.theme-light .app-drawer-entry-icon-shell {
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(243, 248, 255, 0.9) 100%);
+            border: 1px solid rgba(198, 217, 244, 0.88);
+        }
+
+        window.theme-light .top-drawer-sheet {
+            background: rgba(255, 255, 255, 0.84);
+            border: 1px solid rgba(198, 217, 244, 0.9);
+            box-shadow:
+                0 18px 38px rgba(154, 176, 206, 0.22),
+                inset 0 1px 0 rgba(255, 255, 255, 0.98);
+        }
+
+        window.theme-light .top-drawer-tile,
+        window.theme-light .top-drawer-row {
+            background: rgba(255, 255, 255, 0.68);
+            border: 1px solid rgba(198, 217, 244, 0.84);
+        }
+
+        window.theme-light .app-host-back {
+            background: rgba(255, 255, 255, 0.62);
+            border: 1px solid rgba(198, 217, 244, 0.88);
+            color: #27456d;
+        }
+
+        window.theme-light .app-host-content {
+            background: rgba(255, 255, 255, 0.36);
         }
 
         window.theme-light .home-app-label {
@@ -1309,12 +1966,42 @@ fn install_css() {
             border: 1px solid rgba(126, 157, 201, 0.16);
         }
 
+        window.theme-dark .nav-card {
+            border: 1px solid rgba(113, 137, 171, 0.26);
+            background: rgba(18, 27, 43, 0.58);
+            box-shadow:
+                0 20px 38px rgba(0, 0, 0, 0.28),
+                inset 0 1px 0 rgba(255, 255, 255, 0.04);
+        }
+
+        window.theme-dark .nav-card-pulse {
+            background: rgba(24, 35, 54, 0.72);
+            box-shadow:
+                0 22px 42px rgba(0, 0, 0, 0.32),
+                inset 0 1px 0 rgba(255, 255, 255, 0.07);
+        }
+
+        window.theme-dark .nav-card-pulse-settle {
+            background: rgba(21, 31, 48, 0.64);
+            box-shadow:
+                0 20px 39px rgba(0, 0, 0, 0.3),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
+        }
+
         window.theme-dark .top-safe-island {
             background: rgba(4, 9, 16, 0.96);
             box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
         }
 
         window.theme-dark .home-indicator {
+            background: rgba(231, 239, 249, 0.82);
+        }
+
+        window.theme-dark .top-drawer-handle {
+            background: rgba(231, 239, 249, 0.52);
+        }
+
+        window.theme-dark .app-drawer-handle {
             background: rgba(231, 239, 249, 0.82);
         }
 
@@ -1361,8 +2048,8 @@ fn install_css() {
 
         window.theme-dark .nav-button,
         window.theme-dark .theme-button {
-            background: rgba(19, 31, 49, 0.78);
-            border: 1px solid rgba(96, 125, 164, 0.24);
+            background: transparent;
+            border: none;
             color: #c9dcf8;
         }
 
@@ -1373,13 +2060,12 @@ fn install_css() {
         window.theme-dark .nav-button-active,
         window.theme-dark .theme-button-active {
             background:
-                linear-gradient(180deg, rgba(53, 122, 213, 0.42) 0%, rgba(106, 86, 207, 0.34) 100%);
-            border: 1px solid rgba(119, 170, 240, 0.48);
+                linear-gradient(180deg, rgba(50, 65, 93, 0.74) 0%, rgba(38, 51, 76, 0.88) 100%);
+            border: 1px solid rgba(123, 146, 183, 0.28);
             color: #ffffff;
             box-shadow:
-                0 0 0 1px rgba(132, 184, 249, 0.38),
-                0 0 24px rgba(59, 141, 245, 0.32),
-                0 12px 28px rgba(27, 85, 157, 0.42);
+                0 14px 30px rgba(0, 0, 0, 0.28),
+                inset 0 1px 0 rgba(255, 255, 255, 0.06);
         }
 
         window.theme-dark .nav-button-active image {
@@ -1405,15 +2091,62 @@ fn install_css() {
         }
 
         window.theme-dark .apps-icon-shell {
-            background: linear-gradient(180deg, rgba(22, 37, 58, 0.96) 0%, rgba(17, 28, 44, 0.9) 100%);
-            border: 1px solid rgba(95, 125, 168, 0.28);
-            box-shadow:
-                inset 0 1px 0 rgba(255, 255, 255, 0.05),
-                0 14px 26px rgba(0, 0, 0, 0.28);
+            background: transparent;
+            border: none;
+            box-shadow: none;
         }
 
         window.theme-dark .apps-icon-label {
             color: #edf5ff;
+        }
+
+        window.theme-dark .app-drawer-sheet {
+            background: rgba(10, 18, 29, 0.88);
+            border: 1px solid rgba(101, 132, 176, 0.22);
+            box-shadow:
+                0 18px 42px rgba(0, 0, 0, 0.34),
+                inset 0 1px 0 rgba(255, 255, 255, 0.04);
+        }
+
+        window.theme-dark .app-drawer-close,
+        window.theme-dark .app-drawer-entry {
+            background: rgba(19, 31, 49, 0.82);
+            border: 1px solid rgba(96, 125, 164, 0.24);
+            color: #d4e5ff;
+        }
+
+        window.theme-dark .app-drawer-entry-active {
+            background: linear-gradient(180deg, rgba(53, 122, 213, 0.34) 0%, rgba(106, 86, 207, 0.28) 100%);
+            border: 1px solid rgba(119, 170, 240, 0.44);
+        }
+
+        window.theme-dark .app-drawer-entry-icon-shell {
+            background: linear-gradient(180deg, rgba(22, 37, 58, 0.96) 0%, rgba(17, 28, 44, 0.9) 100%);
+            border: 1px solid rgba(95, 125, 168, 0.28);
+        }
+
+        window.theme-dark .top-drawer-sheet {
+            background: rgba(10, 18, 29, 0.9);
+            border: 1px solid rgba(101, 132, 176, 0.22);
+            box-shadow:
+                0 18px 42px rgba(0, 0, 0, 0.32),
+                inset 0 1px 0 rgba(255, 255, 255, 0.04);
+        }
+
+        window.theme-dark .top-drawer-tile,
+        window.theme-dark .top-drawer-row {
+            background: rgba(19, 31, 49, 0.82);
+            border: 1px solid rgba(96, 125, 164, 0.24);
+        }
+
+        window.theme-dark .app-host-back {
+            background: rgba(18, 31, 49, 0.78);
+            border: 1px solid rgba(96, 125, 164, 0.24);
+            color: #d4e5ff;
+        }
+
+        window.theme-dark .app-host-content {
+            background: rgba(8, 15, 24, 0.24);
         }
 
         window.theme-dark .home-app-label {

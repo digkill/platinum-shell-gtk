@@ -1,9 +1,19 @@
-<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<svg width="74" height="74" viewBox="0 0 74 74" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="call-green" x1="3.5" y1="4.5" x2="20.5" y2="20.5" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#6BEA67"/>
-      <stop offset="1" stop-color="#39C44C"/>
+    <linearGradient id="callBg" x1="11" y1="8" x2="63" y2="66" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ECFFF2"/>
+      <stop offset="1" stop-color="#D3F6DA"/>
     </linearGradient>
+    <linearGradient id="callGreen" x1="19" y1="16" x2="55" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#68EA66"/>
+      <stop offset="1" stop-color="#31C248"/>
+    </linearGradient>
+    <filter id="callShadow" x="0" y="0" width="74" height="74" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="8" flood-color="#7FAA87" flood-opacity="0.16"/>
+    </filter>
   </defs>
-  <path d="M7.1 2.9C7.9 2.2 9 2.1 9.9 2.6L12.2 4C13 4.5 13.2 5.6 12.7 6.4L11.4 8.3C11 8.9 11.1 9.8 11.6 10.3L15.7 14.4C16.2 14.9 17.1 15 17.7 14.6L19.6 13.3C20.4 12.8 21.5 13 22 13.8L23.4 16.1C23.9 17 23.8 18.1 23.1 18.9L22.1 19.9C20.5 21.5 18 21.9 15.8 20.9C13.6 19.9 11.4 18.4 9.4 16.4C7.4 14.4 5.9 12.2 4.9 10C3.9 7.8 4.3 5.3 5.9 3.7L6.9 2.7Z" fill="url(#call-green)" transform="translate(0.6 0.6) scale(0.78)"/>
+  <g filter="url(#callShadow)">
+    <rect x="7" y="7" width="60" height="60" rx="18" fill="url(#callBg)"/>
+  </g>
+  <path d="M24.5 18.6C26.9 16.5 30 16.1 32.6 17.6L39.2 21.5C41.4 22.9 42 26.2 40.6 28.5L36.9 34C35.8 35.8 36 38.1 37.5 39.6L49.3 51.4C50.8 52.9 53.1 53.1 54.9 52L60.4 48.3C62.7 46.9 66 47.5 67.4 49.7L71.3 56.3C72.8 58.9 72.4 62 70.3 64.4L67.5 67.2C62.9 71.8 55.8 72.9 49.7 70.1C43.5 67.3 37.4 63.1 31.8 57.5C26.2 51.9 22 45.8 19.2 39.6C16.4 33.5 17.5 26.4 22.1 21.8L24.9 19L24.5 18.6Z" fill="url(#callGreen)" transform="translate(-7 -7) scale(0.78) translate(11 11)"/>
 </svg>

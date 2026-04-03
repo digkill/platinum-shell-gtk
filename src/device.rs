@@ -7,10 +7,8 @@ pub struct DeviceSnapshot {
     pub battery_level: u8,
     pub battery_charging: bool,
     pub date_label: String,
-    pub mode_label: String,
     pub network_kind: NetworkKind,
     pub network_is_online: bool,
-    pub network_label: String,
     pub signal_level: u8,
     pub time_label: String,
 }
@@ -27,7 +25,6 @@ pub enum NetworkKind {
 struct NetworkSnapshot {
     kind: NetworkKind,
     is_online: bool,
-    label: String,
     signal_level: u8,
 }
 
@@ -40,10 +37,8 @@ pub fn load_device_snapshot() -> DeviceSnapshot {
         battery_level,
         battery_charging,
         date_label: now.format("%a, %d %b").to_string(),
-        mode_label: String::from("Field Ready"),
         network_kind: network.kind,
         network_is_online: network.is_online,
-        network_label: network.label,
         signal_level: network.signal_level,
         time_label: now.format("%H:%M").to_string(),
     }
@@ -111,7 +106,6 @@ impl NetworkSnapshot {
         Self {
             kind: NetworkKind::Offline,
             is_online: false,
-            label: String::from("Offline"),
             signal_level: 0,
         }
     }
@@ -136,11 +130,6 @@ fn read_linux_network_snapshot() -> Option<NetworkSnapshot> {
     let line = stdout.lines().find(|line| line.contains(":connected:"))?;
     let parts = line.split(':').collect::<Vec<_>>();
     let kind = parts.first().copied().unwrap_or("wifi");
-    let connection = parts
-        .last()
-        .copied()
-        .filter(|value| !value.is_empty() && *value != "--")
-        .unwrap_or("Connected");
     let signal_percent = parts
         .get(2)
         .and_then(|value| value.parse::<u8>().ok())
@@ -149,7 +138,6 @@ fn read_linux_network_snapshot() -> Option<NetworkSnapshot> {
     Some(NetworkSnapshot {
         kind: network_kind(kind),
         is_online: true,
-        label: String::from(connection),
         signal_level: signal_percent_to_level(signal_percent),
     })
 }
@@ -163,14 +151,6 @@ fn read_macos_network_snapshot() -> Option<NetworkSnapshot> {
     }
 
     let stdout = String::from_utf8(output.stdout).ok()?;
-    let ssid = stdout
-        .lines()
-        .find_map(|line| {
-            line.split_once(" SSID: ")
-                .map(|(_, value)| value.trim().to_string())
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| String::from("Connected"));
     let rssi = stdout.lines().find_map(|line| {
         line.split_once(" agrCtlRSSI: ")
             .and_then(|(_, value)| value.trim().parse::<i32>().ok())
@@ -179,7 +159,6 @@ fn read_macos_network_snapshot() -> Option<NetworkSnapshot> {
     Some(NetworkSnapshot {
         kind: NetworkKind::Wifi,
         is_online: true,
-        label: ssid,
         signal_level: signal_percent_to_level(rssi_to_percent(rssi)),
     })
 }
@@ -212,9 +191,6 @@ fn read_linux_modem_snapshot() -> Option<NetworkSnapshot> {
         return None;
     }
 
-    let operator = find_mmcli_value(&modem_stdout, "operator name")
-        .or_else(|| find_mmcli_value(&modem_stdout, "operator id"))
-        .unwrap_or_else(|| String::from("Cellular"));
     let signal_percent = find_mmcli_value(&modem_stdout, "signal quality")
         .and_then(|value| value.split_whitespace().next().map(String::from))
         .and_then(|value| value.parse::<u8>().ok())
@@ -223,7 +199,6 @@ fn read_linux_modem_snapshot() -> Option<NetworkSnapshot> {
     Some(NetworkSnapshot {
         kind: NetworkKind::Lte,
         is_online: true,
-        label: operator,
         signal_level: signal_percent_to_level(signal_percent),
     })
 }
@@ -243,10 +218,7 @@ fn network_kind(kind: &str) -> NetworkKind {
         "ethernet" => NetworkKind::Ethernet,
         "gsm" | "wwan" => NetworkKind::Lte,
         "offline" => NetworkKind::Offline,
-        other => {
-            let _ = other;
-            NetworkKind::Unknown
-        }
+        _ => NetworkKind::Unknown,
     }
 }
 

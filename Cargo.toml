@@ -8,3 +8,4 @@ description = "GTK4/Relm4 shell prototype for Platinum Launcher"
 adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 relm4 = { version = "0.9.1", features = ["macros"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
